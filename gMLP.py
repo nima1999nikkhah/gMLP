@@ -18,29 +18,37 @@ from icecream import ic
 import json
 from PIL import Image
 from einops.layers.torch import Rearrange
+from tqdm import tqdm
+
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 parser = argparse.ArgumentParser(description='ClassifierHybrid')
 
-parser.add_argument('--epochs', type=int, default=1000, metavar='N',
+parser.add_argument('--epochs', type=int, default=10000, metavar='N',
                     help='Number of epochs to train (default: 1000)')
-parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
+parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
                     help='Learning rate (default: 1e-3)')
 parser.add_argument('--img_size', type=int, default=256,
                     help='Image size as input (default: 128)')
 parser.add_argument('--num_classes', type=int, default=49,
                     help='Number of classes (default: 196)')
-parser.add_argument('--num_patches', type=int, default=256,
-                    help='Number of patches (default: 256)')
-parser.add_argument('--patch_dim', type=int, default=128,
+parser.add_argument('--multiplier', type=int, default=6,
+                    help='Multiplier in SGU (default: 6)')
+parser.add_argument('--patch_dim', type=int, default=192,
                     help='Dimention of patches (default: 192)')
 parser.add_argument('--patch_size', type=int, default=16,
                     help='Patche sizes (default: 8)')
+parser.add_argument('--num_layers', type=int, default=30,
+                    help='Patche sizes (default: 30)')
 parser.add_argument('--data_json', type=str, default='tmpe.json',
                     help='The root of the json file')
-parser.add_argument('--batch_size', type=int, default=50, metavar='N',
+parser.add_argument('--batch_size', type=int, default=20, metavar='N',
                     help='Input batch size for training (default: 10)')
-parser.add_argument('--survival_prob', type=int, default=0.99, metavar='N',
-                    help='Input batch size for training (default: 10)')
+parser.add_argument('--survival_prob', type=int, default=1, metavar='N',
+                    help='Survival probability (default: 1)')
+parser.add_argument('--weight_decay', type=float, default=0.05, metavar='WD',
+                    help='Weight decay (default: 0.05)')
 
 args = parser.parse_args()
 
@@ -275,13 +283,13 @@ class Residual(nn.Module):
     def __init__(self, survival_prob, fn):
         super().__init__()
         self.prob = torch.rand(1)
+
         self.survival_prob = survival_prob
         self.fn = fn
 
     def forward(self, x):
         if self.prob <= self.survival_prob:
             return self.fn(x) + x
-
         else:
             return self.fn(x)
 
@@ -312,30 +320,17 @@ class SpatialGatingUnit(nn.Module):
     def forward(self, x):
 
         # x: shape = (batch,  dim_seq,  channel)
-
         res, gate = torch.split(
-            tensor=x, split_size_or_sections=self.dim_ff // 2, dim=2)
-
+            tensor=x, split_size_or_sections=self.dim_ff // 2, dim=2)  # ch
         # res, gate: shape = (batch,  dim_seq,  channel//2)
-
         gate = self.norm(gate)
-
         # gate: shape = (batch,  dim_seq,  channel//2)
-
         gate = torch.transpose(gate, 1, 2)
-
         # gate: shape = (batch,  channel//2,  dim_seq)
-
         gate = self.proj(gate)
-
         # gate: shape = (batch,  channel//2,  dim_seq)
-
-        gate = self.activation(gate)
-
         gate = torch.transpose(gate, 1, 2)
-
         # gate: shape = (batch,  dim_seq,  channel//2)
-
         return gate * res
 
 
@@ -343,19 +338,19 @@ class gMLPBlock(nn.Module):
     def __init__(self, dim, dim_ff, seq_len):
         super().__init__()
 
-        self.activation1 = nn.ReLU()
-        self.activation2 = nn.SELU()
         self.proj_in = nn.Linear(dim, dim_ff)
+        self.activation = nn.GELU()
         self.sgu = SpatialGatingUnit(seq_len, dim_ff)
         self.proj_out = nn.Linear(dim_ff // 2, dim)
 
     def forward(self, x):
-
+        # shape=(B,  seq,  dim) --> (B,  seq,  dim_ff) --> (B,  seq,  dim_ff/2)
+        # --> (B,  seq,  dim)
         x = self.proj_in(x)
-        x = self.activation1(x)
+        x = self.activation(x)
         x = self.sgu(x)
         x = self.proj_out(x)
-        x = self.activation2(x)
+
         return x
 
 
@@ -380,126 +375,57 @@ class gMLPNet(nn.Module):
             p=self.patch_size,
             q=self.patch_size)  # (b,  3 ,  256,  256) -> (b,  16*16,  3*16*16)
 
-        self.classification_rearrange = Rearrange('b s d -> b (s d)')
-
         dim_ff = dim * ff_mult
 
         initial_dim = 3 * (patch_size ** 2)
 
         num_patches = (image_size // patch_size) ** 2
-
         self.patch_embed = nn.Linear(initial_dim, dim)  # shape=(B,  seq,  dim)
-
+        self.query = torch.nn.Parameter(torch.randn(1, 1, dim))
+        self.query.requires_grad = True
         self.dim = dim
 
         module_list = [Residual(survival_prob,
                                 PreNorm(dim,
                                         gMLPBlock(dim=dim,
                                                   dim_ff=dim_ff,
-                                                  seq_len=num_patches,
+                                                  seq_len=num_patches + 1,
                                                   ))) for i in range(depth)]
 
         self.glayers = nn.Sequential(*module_list)
 
         self.norm = nn.LayerNorm(normalized_shape=dim, eps=1e-5)
 
-        self.clssification_head = nn.Sequential(
-            nn.Linear(
-                num_patches * dim,
-                dim),
-            nn.ReLU(),
-            nn.Dropout(
-                p=0.3),
-            nn.Linear(
-                dim,
-                num_classes),
-            nn.Dropout(
-                p=0.3))
-
-    def extract_patches(self, images):
-
-        batch_size = images.size(0)
-
-        patches = self.patch_rearrange(images)
-
-        return patches
-
-    def forward(self, x):
-
-        # shape=(B,  num_patches,  patch_size**2 * C)
-        x = self.extract_patches(x)
-        x = self.patch_embed(x)  # shape=(B,  num_patches,  dim)
-        x = self.glayers(x)  # shape=(B,  num_patches,  dim)
-        x = self.norm(x)  # shape=(B,  num_patches,  dim)
-        x = self.classification_rearrange(x)  # shape=(B,  num_patches*dim)
-        x = self.clssification_head(x)
-
-        return x
-
-
-class gMLPFeatures(nn.Module):
-    def __init__(
-            self,
-            survival_prob=0.99,
-            image_size=256,
-            patch_size=16,
-            dim=128,
-            depth=30,
-            ff_mult=2,
-            num_classes=196):
-        super().__init__()
-
-        self.image_size = image_size
-
-        self.patch_size = patch_size
-
-        self.patch_rearrange = Rearrange(
-            'b c (h p) (w q) -> b (h w) (c p q)',
-            p=self.patch_size,
-            q=self.patch_size)  # (b,  3 ,  256,  256) -> (b,  16*16,  3*16*16)
-
         self.classification_rearrange = Rearrange('b s d -> b (s d)')
 
-        dim_ff = dim * ff_mult
-
-        initial_dim = 3 * (patch_size ** 2)
-
-        num_patches = (image_size // patch_size) ** 2
-
-        self.patch_embed = nn.Linear(initial_dim, dim)  # shape=(B,  seq,  dim)
-
-        self.dim = dim
-
-        module_list = [Residual(survival_prob,
-                                PreNorm(dim,
-                                        gMLPBlock(dim=dim,
-                                                  dim_ff=dim_ff,
-                                                  seq_len=num_patches,
-                                                  ))) for i in range(depth)]
-
-        self.glayers = nn.Sequential(*module_list)
-
-        self.norm = nn.LayerNorm(normalized_shape=dim, eps=1e-5)  # ch
+        self.clssification_head = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, num_classes)
+        )
 
     def extract_patches(self, images):
 
         batch_size = images.size(0)
-
         patches = self.patch_rearrange(images)
 
         return patches
 
     def forward(self, x):
 
-        x = (x - 128.0) / 128.0
-
         # shape=(B,  num_patches,  patch_size**2 * C)
         x = self.extract_patches(x)
         x = self.patch_embed(x)  # shape=(B,  num_patches,  dim)
-
+        B, seq, dim = x.shape
+        query_1 = self.query.repeat((B, 1, 1))
+        x = torch.cat([query_1, x], dim=1)
         x = self.glayers(x)  # shape=(B,  num_patches,  dim)
         x = self.norm(x)  # shape=(B,  num_patches,  dim)
-        x = self.classification_rearrange(x)  # shape=(B,  num_patches*dim)
+        x = x[:, 0:1, :]
+
+        x = self.classification_rearrange(x)
+
+        x = self.clssification_head(x)
 
         return x
 
@@ -514,51 +440,78 @@ def main():
         img_size=args.img_size)
     dtld = DataLoader(dtst, shuffle=True, batch_size=args.batch_size)
 
-    gmlp = gMLPNet(
+    model = gMLPNet(
         survival_prob=args.survival_prob,
         image_size=args.img_size,
         patch_size=args.patch_size,
         dim=args.patch_dim,
-        depth=50,
-        ff_mult=2,
+        depth=args.num_layers,
+        ff_mult=args.multiplier,
         num_classes=args.num_classes)
-    gmlp = gmlp.train()
-    criterion = nn.CrossEntropyLoss()
 
-    optimizer = optim.SGD(gmlp.parameters(), lr=args.lr, momentum=0.9)
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    ic(count_parameters(model))
+    model = model.to(device).train()
+
+    criterion = nn.CrossEntropyLoss().to(device)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(
+            0.9,
+            0.999),
+        eps=1e-08,
+        weight_decay=args.weight_decay,
+        amsgrad=False)
+
+    log_dir = './logs'
+    writer = SummaryWriter(log_dir=log_dir, flush_secs=30)
+
+    iteration = 0
 
     for epoch in range(args.epochs):
         running_loss = 0.0
-        for i, data in enumerate(dtld, 0):
+        num_true = 0
+        num_total = 0
+        count = 0
+        with tqdm(dtld, unit="batch") as t_iter:
+            for data in t_iter:
+                iteration += 1
+                inpt, label = data
+                inpt = inpt.to(device)
+                label = label.to(device)
+                optimizer.zero_grad()
 
-            inpt, label = data
+                output = model(inpt)
 
-            optimizer.zero_grad()
+                flag = (torch.argmax(output, dim=1) == label)
 
-            output = gmlp(inpt)
+                sm = torch.sum(flag)
+                num_true_1_batch = sm.cpu().numpy()
+                num_total += args.batch_size
+                num_true += num_true_1_batch
 
-            flag = (torch.argmax(output, dim=1) == label)
+                error = criterion(output, label)
+                error.backward()
+                y = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-            sm = torch.sum(flag)
+                running_loss += error.detach().cpu().numpy()
+                count += 1
+                train_accuracy = num_true_1_batch / args.batch_size
 
-            ic(sm.numpy() / (args.batch_size))
-
-            error = criterion(output, label)
-
-            error.backward()
-
-            ic(error.item())
-
-            y = nn.utils.clip_grad_norm_(gmlp.parameters(), max_norm=1.0)
-            # ic(y)
-
-            optimizer.step()
-
-            running_loss += error.item()
-            if i % 100 == 99:
-                print('[%d,  %5d] loss: %.3f' %
-                      (epoch + 1, i + 1, running_loss / 100))
-                running_loss = 0.0
+                writer.add_scalar(
+                    'Loss/train',
+                    error.detach().cpu().numpy(),
+                    iteration)
+                writer.add_scalar('Accuracy/train', train_accuracy, iteration)
+                writer.flush()
+                t_iter.set_postfix(loss=error.item(),
+                                   running_loss=running_loss / count,
+                                   total_train_accuracy=num_true / num_total,
+                                   train_accuracy=train_accuracy
+                                   )
 
 
 if __name__ == "__main__":
