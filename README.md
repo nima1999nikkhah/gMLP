@@ -4,4 +4,9 @@ This architecture has been proven to be more efficient and faster compared to Vi
 
 The network is trained with "Stanford's Cars 196" dataset.
 
-![Alt text](gMLP.png?raw=true "Image")
+<p align = "center">
+<img src = "gMLP.png">
+</p>
+<p align = "center">
+Fig.1 - gMLP Architecture
+</p>
